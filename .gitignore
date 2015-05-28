@@ -1,0 +1,45 @@
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Project files
+*.sln
+*.vc*proj*
+*.suo
+*.sdf
+*.opensdf
+*.vspx
+*.pdb
+*.ilk
+
+# Scripts
+*.py
+
+# Others
+obj
+Thumbs.db
