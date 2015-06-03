@@ -1,6 +1,16 @@
 
 #pragma once
 #include "ws-util.h"
+#include "MemoryPool.hpp"
+
+#include <mutex>
+
+
+/// 一些特殊的标记用 completion key
+enum SpecialCompKeys {
+    SCK_EXIT = 1, ///< 退出
+    SCK_NAME_RESOLVE, ///< 异步 DNS 解释操作已完成
+};
 
 /// IOCP 异步操作上下文
 struct PerIoContext {
@@ -61,7 +71,8 @@ struct RxContext : public PerIoContext {
     RxContext(SOCKET sd);
 
     /// 复制构造函数
-    RxContext(const RxContext &other);
+    RxContext(const RxContext &other) = delete;
+    RxContext &operator=(const RxContext &other);
 
     /// 为下次 RECV 操作做好准备
     void PrepareForNextRecv();
@@ -78,13 +89,34 @@ struct RxContext : public PerIoContext {
 
 /// IOCP 发送缓冲区
 struct TxContext : public PerIoContext {
+    enum {
+        /// 对象池静态分配的数目
+        STATIC_POOL_SIZE = 16,
+
+        /// 对象池每次动态分配的数目
+        DYNAMIC_POOL_SIZE = STATIC_POOL_SIZE,
+    };
+
     /// 构造函数
-    TxContext(SOCKET sd, const char *buf, int len);
+    TxContext();
     /// 禁止复制
     TxContext(const TxContext &) = delete;
 
     /// 析构函数
     ~TxContext();
+
+    /// 初始化
+    void Init(SOCKET sd, const char *buf, int len);
+
+    /// 总是可以重用
+    /// 
+    /// @todo constexpr
+    static bool IsRecyclable() {
+        return true;
+    }
+
+    /// 重置
+    void Reset();
 
     WSABUF *buffers; ///< 缓冲区列表
     DWORD nb; ///< 缓冲区个数
@@ -93,8 +125,14 @@ struct TxContext : public PerIoContext {
     DWORD tx;
 };
 
-/// 一些特殊的标记用 completion key
-enum SpecialCompKeys {
-    SCK_EXIT = 1, ///< 退出
-    SCK_NAME_RESOLVE, ///< 异步 DNS 解释操作已完成
+/// TxContext 对象内存池
+class TxContextPool : public MemoryPool<TxContext, std::mutex> {
+public:
+
+    /// 获取单体对象
+    static TxContextPool &GetInstance();
+
+private:
+
+    TxContextPool();
 };

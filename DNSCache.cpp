@@ -5,6 +5,8 @@
 #include <mutex>
 using namespace std;
 
+#include "Debug.hpp"
+
 //////////////////////////////////////////////////////////////////////////
 
 double DNSCache::EXPIRATION = 60 * 60 * 1;
@@ -12,7 +14,7 @@ DNSCache::Cache DNSCache::ms_cache;
 static mutex gs_loggerMutex;
 
 
-const DNSCache::Entry *DNSCache::Resolve(const string &dname) {
+DNSCache::AI *DNSCache::Resolve(const string &dname) {
     lock_guard<mutex> lock(gs_loggerMutex);
 
     auto it(ms_cache.find(dname));
@@ -27,24 +29,16 @@ const DNSCache::Entry *DNSCache::Resolve(const string &dname) {
         // 延长有效期：更新为当前时间戳
         it->second.ts = curr;
 
-        return &(it->second);
+        return it->second.CopyAddrInfo();
     }
 
     return nullptr;
 }
 
 void DNSCache::Add(const std::string &dname, const AI &ai) {
-    lock_guard<mutex> lock(gs_loggerMutex);
-
-    auto it(ms_cache.find(dname));
-    if (it != ms_cache.end()) {
-        if (&(it->second.ai) == &ai) {
-            it->second.ts = time(nullptr);
-            return;
-        }
-    }
-
+    gs_loggerMutex.lock();
     ms_cache.emplace(dname, &ai);
+    gs_loggerMutex.unlock();
 }
 
 bool DNSCache::Remove(const std::string &dname) {
@@ -81,6 +75,18 @@ DNSCache::Entry::~Entry() {
     if (IsOk()) {
         delete ai.ai_addr;
     }
+}
+
+DNSCache::AI *DNSCache::Entry::CopyAddrInfo() const {
+    AI *ret = new AI(ai);
+    ret->ai_addr = new sockaddr(*(ai.ai_addr));
+
+    return ret;
+}
+
+void DNSCache::DestroyAddrInfo(AI *ai) {
+    delete ai->ai_addr;
+    delete ai;
 }
 
 bool DNSCache::Entry::IsOk() const {

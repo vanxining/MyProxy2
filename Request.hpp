@@ -1,14 +1,20 @@
 
 #pragma once
+
 #include "Logger.hpp"
 #include "PerIoContext.hpp"
 #include "Async.hpp"
+#include "MemoryPool.hpp"
 #include "ws-util.h"
 
+#include <ctime>
 #include <vector>
 #include <unordered_map>
 #include <atomic>
+#include <mutex>
 using namespace std;
+
+#define SOCKET_bind ::bind
 
 /// 来自浏览器的一次请求
 /// 
@@ -16,11 +22,22 @@ using namespace std;
 class Request : public AsyncResolver::Callback {
 public:
 
+    enum {
+        /// 对象池静态分配的数目
+        STATIC_POOL_SIZE = 256,
+
+        /// 对象池每次动态分配的数目
+        DYNAMIC_POOL_SIZE = STATIC_POOL_SIZE,
+    };
+
     /// 构造函数
-    Request(const RxContext &acceptContext, HANDLE cp);
+    Request();
 
     /// 析构函数
     ~Request();
+
+    /// 初始化
+    void Init(HANDLE cp, const RxContext &acceptContext);
 
     /// 处理来自浏览器的连接
     void HandleBrowser();
@@ -63,7 +80,15 @@ public:
     /// 获取统计信息
     static Statistics GetStatistics();
 
+public:
+
+    /// 当前是否可以重用
+    bool IsRecyclable() const;
+
 private:
+
+    // 重置对象为“清洁”的状态
+    void Clear();
 
     // 销毁自己
     void DeleteThis();
@@ -101,6 +126,9 @@ private:
     // 提交异步 DNS 解释请求
     bool PostDnsQuery();
 
+    // 销毁当前使用的 QueryContext
+    void DelQueryContext();
+
     // 使用地址链表中的头结点连接到服务器
     void PostConnect();
 
@@ -117,6 +145,10 @@ private:
 
     // 便利函数：快速创建一个 TxContext
     static TxContext *NewTxContext(SOCKET sd, const RxContext &context);
+    static TxContext *NewTxContext(SOCKET sd, const char *buf, int len);
+
+    // 销毁一个 TxContext
+    static void DelTxContext(TxContext *context);
 
     // 提交异步接收请求
     bool PostRecv(RxContext &context);
@@ -136,7 +168,7 @@ private:
 
 private:
 
-    HANDLE m_cp;
+    HANDLE m_cp = nullptr;
 
     // 保存由浏览器发来的包含完整 HTTP 头部的一段数据
     // 可能不单单只是 HTTP 头部信息。
@@ -146,6 +178,7 @@ private:
         void Clear() {
             this->name.clear();
             this->port = 0;
+            this->tunel = false;
         }
 
         bool operator!=(const Host &other) {
@@ -165,7 +198,7 @@ private:
 
     AsyncResolver m_resolver;
     QueryContext *m_qcontext = nullptr;
-    ADDRINFOEX const *m_ai = nullptr; // 当前尝试的 addrinfo 结构
+    ADDRINFOEX *m_ai = nullptr; // 当前尝试的 addrinfo 结构
     ConnectContext m_ccontext;
 
     // HTTP 头部
@@ -217,10 +250,26 @@ private:
 
 private:
 
+    time_t m_delTS = 0; // 被删除时的时间戳
+
+private:
+
     // 调试用
     bool m_everRx = false; // 确实接收到过数据
-    bool m_noAttachedData = false; // 一开始就没有数据进来
+    bool m_noAttachedData = true; // 一开始就没有数据进来
 
     // 来自服务器的第一个请求是否已然收到
     bool m_firstResponseRecv = false;
+};
+
+/// Request 对象内存池
+class RequestPool : public MemoryPool<Request, mutex> {
+public:
+
+    /// 获取单体对象
+    static RequestPool &GetInstance();
+
+private:
+
+    RequestPool() {}
 };

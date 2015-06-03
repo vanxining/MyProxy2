@@ -4,6 +4,8 @@
 
 #include <cassert>
 
+#include "Debug.hpp"
+
 //////////////////////////////////////////////////////////////////////////
 
 AsyncResolver::QueryContext::QueryContext
@@ -24,6 +26,8 @@ AsyncResolver::QueryContext::QueryContext
 
     // WTF!! swprintf_s 都写了一些什么垃圾数据进去？？
     swprintf(service, sizeof(service), L"%u", port);
+
+    ts = time(nullptr);
 
     this->resolver = resolver;
     userData = request.userData;
@@ -48,8 +52,13 @@ AsyncResolver::~AsyncResolver() {
 
 }
 
+void AsyncResolver::Cancel() {
+    m_ts = 0;
+}
+
 bool AsyncResolver::PostResolve(const Request &request) {
     QueryContext *context = new QueryContext(this, request);
+    m_ts = context->ts;
 
     int error = GetAddrInfoExW(context->host,
                                context->service,
@@ -80,10 +89,17 @@ bool AsyncResolver::PostResolve(const Request &request) {
 /*static*/
 void CALLBACK AsyncResolver::OnDnsResolved
 (DWORD error, DWORD, LPWSAOVERLAPPED ol) {
+    QueryContext *context = (QueryContext *) ol;
+
+    // 用户取消了请求
+    if (context->ts != context->resolver->m_ts) {
+        return;
+    }
+
     if (error != ERROR_SUCCESS) {
         Logger::LogError(__FUNC__ "GetAddrInfoExW() failed");
     }
 
-    QueryContext *context = (QueryContext *) ol;
     context->resolver->m_callback->OnQueryCompleted(context);
+    context->resolver->m_ts = 0;
 }

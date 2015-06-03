@@ -2,6 +2,7 @@
 #pragma once
 #include "ws-util.h"
 #include <ws2tcpip.h>
+#include <ctime>
 
 /// 异步解释 DNS
 class AsyncResolver {
@@ -25,6 +26,9 @@ public:
     /// 提交解释请求
     bool PostResolve(const Request &request);
 
+    /// 取消解释请求
+    void Cancel();
+
 public:
 
     /// DNS 解释操作上下文信息
@@ -37,6 +41,8 @@ public:
 
         ADDRINFOEX hints;
         wchar_t service[6];
+
+        time_t ts; // 提交时的时间戳
 
         AsyncResolver *resolver;
         void *userData;
@@ -68,4 +74,5 @@ private:
 private:
 
     Callback *m_callback = nullptr;
+    time_t m_ts = 0;
 };

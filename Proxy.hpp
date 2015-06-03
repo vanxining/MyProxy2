@@ -1,7 +1,10 @@
 
 #pragma once
 #include "ws-util.h"
-#include "ThreadPool.hpp" // 必须放在 "ws-util.h" 之后
+
+#include <vector>
+#include <atomic>
+#include <memory>
 
 struct RxContext;
 class Request;
@@ -16,8 +19,8 @@ public:
     /// 析构函数
     ~MyProxy();
 
-    /// 允许主循环
-    bool Run(const char *addr, u_short port);
+    /// 开始服务
+    bool Start(const char *addr, u_short port);
 
 private:
 
@@ -43,11 +46,11 @@ private:
 
 private:
 
+    HANDLE m_cp = nullptr;
     SOCKET m_listener;
-    HANDLE m_cp;
 
-    ThreadPool m_threadPool;
+    typedef std::vector<std::shared_ptr<RxContext>> AcceptorVec;
 
-    int m_requestPoolSize;
-    int m_numActiveRequests;
+    AcceptorVec m_acceptors;
+    std::atomic_int m_numExitedThreads; // 已退出的线程数目
 };

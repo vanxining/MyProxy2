@@ -19,6 +19,22 @@ public:
     /// WinSock 有特殊的定义
     typedef ADDRINFOEX AI;
 
+    /// 解析域名
+    /// 
+    /// 调用者需要接管返回的指针，删除可通过 #DestroyAddrInfo() 函数
+    static AI *Resolve(const std::string &dname);
+
+    /// 销毁一个由 #Resolve() 返回的 AI 对象
+    static void DestroyAddrInfo(AI *ai);
+
+    /// 将域名对应的 IP 地址加入缓存
+    static void Add(const std::string &dname, const AI &ai);
+
+    /// 删除失效条目
+    static bool Remove(const std::string &dname);
+
+private:
+
     /// 一个缓存条目
     struct Entry {
         /// 构造函数
@@ -33,19 +49,12 @@ public:
         /// 条目是否有效
         bool IsOk() const;
 
+        /// 复制 #ai 结构
+        AI *CopyAddrInfo() const;
+
         AI ai;
-        bool home = false;
         time_t ts = 0; ///< 加入缓存的时间
     };
-
-    /// 解析域名
-    static const Entry *Resolve(const std::string &dname);
-
-    /// 将域名对应的 IP 地址加入缓存
-    static void Add(const std::string &dname, const AI &ai);
-
-    /// 删除失效条目
-    static bool Remove(const std::string &dname);
 
 private:
 

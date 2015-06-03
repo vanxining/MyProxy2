@@ -9,6 +9,8 @@
 #include <cassert>
 #include <cstdio>
 
+#include "Debug.hpp"
+
 
 //////////////////////////////////////////////////////////////////////////
 
@@ -29,17 +31,22 @@ extern LPFN_CONNECTEX lpfnConnectEx;
 
 Request::Statistics Request::ms_stat;
 
-Request::Request(const RxContext &acceptContext, HANDLE cp)
-    : m_cp(cp),
-      m_vbuf(0),
+Request::Request()
+    : m_vbuf(0),
       m_resolver(this),
       m_ccontext(INVALID_SOCKET),
-      m_bcontext(acceptContext),
+      m_bcontext(INVALID_SOCKET),
       m_scontext(INVALID_SOCKET) {}
 
 Request::~Request() {
-    ShutdownBrowserSocket();
-    ShutdownServerSocket();
+    Clear();
+}
+
+void Request::Init(HANDLE cp, const RxContext &acceptContext) {
+    m_cp = cp;
+    m_bcontext = acceptContext;
+
+    m_delTS = 0;
 }
 
 void Request::ShutdownBrowserSocket() {
@@ -66,9 +73,7 @@ void Request::ShutdownBrowserSocket() {
 bool Request::ShutdownServerSocket() {
     if (!m_scontext.IsOk()) {
         if (m_ccontext.IsOk()) {
-            delete m_qcontext;
-            m_qcontext = nullptr;
-            m_ai = nullptr;
+            DelQueryContext();
 
             auto sd = m_ccontext.sd;
             m_ccontext.Reset();
@@ -88,17 +93,48 @@ bool Request::ShutdownServerSocket() {
     return ShutdownConnection(sd);
 }
 
+void Request::Clear() {
+    m_cp = nullptr;
+    m_vbuf.clear();
+    m_host.Clear();
+
+    m_resolver.Cancel();
+    DelQueryContext();
+    m_ccontext.Reset();
+
+    m_headers.Clear();
+
+    m_bcontext.Reset();
+    m_brx = m_btotal = 0;
+    m_scontext.Reset();
+    m_brxPosted = m_srxPosted = false;
+
+    m_delTS = 0;
+
+    m_everRx = false;
+    m_noAttachedData = true;
+    m_firstResponseRecv = false;
+}
+
 void Request::DeleteThis() {
     ShutdownBrowserSocket();
     ShutdownServerSocket();
 
-    return;
-    delete this;
+    Clear();
+
+    m_delTS = time(nullptr);
+    RequestPool::GetInstance().DeAllocate(this);
+}
+
+bool Request::IsRecyclable() const {
+    assert(m_delTS != 0);
+    return difftime(time(nullptr), m_delTS) > 20;
 }
 
 void Request::HandleBrowser() {
     if (m_bcontext.rx > 0) {
         m_everRx = true;
+        m_noAttachedData = false;
     }
     else if (!m_noAttachedData) {
         m_noAttachedData = true;
@@ -151,8 +187,8 @@ void Request::OnUploadDone() {
     m_btotal = 0;
     m_brx = 0;
 
-    m_headers.Clear();
     m_vbuf.clear();
+    m_headers.Clear();
 
     m_firstResponseRecv = false;
 }
@@ -180,10 +216,9 @@ bool Request::TryParsingHeaders() {
 }
 
 void Request::OnRecvCompleted(RxContext &context) {
-    // 可能的场景：一方终止了连接，我们也终止了与另一方的连接，
-    // 此时另一方可能会发一个 FIN 包过来
+    // 场景：浏览器终止了连接，我们也终止了与服务器的连接，
+    // 此时服务器发了最后一个 FIN 包过来
     if (!context.IsOk()) {
-        LogError(__FUNC__ "Hanging recv op");
         return;
     }
 
@@ -239,7 +274,9 @@ void Request::OnRecvCompleted(RxContext &context) {
                 }
                 else {
                     LogError(__FUNC__ "Fatal: Incorrect response header");
-                    assert(false);
+                    
+                    DeleteThis();
+                    return;
                 }
             }
         }
@@ -258,7 +295,7 @@ void Request::OnRecvCompleted(RxContext &context) {
 }
 
 void Request::OnSendCompleted(TxContext *&context) {
-    if (context->tx != context->buffers->len) {
+    if (m_bcontext.IsOk() && context->tx != context->buffers->len) {
         ostringstream oss;
         oss << __FUNC__ "Byte count: " << context->buffers->len
             << " Transfered: " << context->tx;
@@ -266,8 +303,7 @@ void Request::OnSendCompleted(TxContext *&context) {
         LogError(oss.str());
     }
 
-    // TODO: memory pool
-    delete context;
+    DelTxContext(context);
     context = nullptr;
 }
 
@@ -321,7 +357,7 @@ bool Request::DoHandleServer() {
     assert(!m_host.tunel);
 
     // 转发第一批数据到服务器
-    auto tc = new TxContext(m_scontext.sd, m_vbuf.data(), m_vbuf.size() - 1);
+    auto tc = NewTxContext(m_scontext.sd, m_vbuf.data(), m_vbuf.size() - 1);
     if (!PostSend(tc)) {
         return false;
     }
@@ -345,15 +381,26 @@ bool Request::TryDNSCache() {
     assert(!m_qcontext);
     ms_stat.dnsQueries++;
 
-    auto entry = DNSCache::Resolve(m_host.GetFullName());
-    if (entry) {
-        m_ai = &entry->ai;
+    m_ai = DNSCache::Resolve(m_host.GetFullName());
+    if (m_ai) {
         PostConnect();
-
         return true;
     }
 
     return false;
+}
+
+void Request::DelQueryContext() {
+    if (m_qcontext) {
+        delete m_qcontext;
+        m_qcontext = nullptr;
+    }
+    // 来自 DNS 缓存
+    else if (m_ai) {
+        DNSCache::DestroyAddrInfo(m_ai);
+    }
+    
+    m_ai = nullptr;
 }
 
 bool Request::PostDnsQuery() {
@@ -395,7 +442,7 @@ bool Bind(SOCKET sd, const ADDRINFOEX &ai) {
         addr.sin_addr.s_addr = INADDR_ANY;
         addr.sin_port = 0;
 
-        if (bind(sd, (sockaddr *) &addr, sizeof(addr)) != 0) {
+        if (SOCKET_bind(sd, (sockaddr *)&addr, sizeof(addr)) != 0) {
             auto prefix = __FUNC__ "bind() failed";
             Logger::LogError(WSAGetLastErrorMessage(prefix));
 
@@ -410,7 +457,7 @@ bool Bind(SOCKET sd, const ADDRINFOEX &ai) {
         addr.sin6_addr = in6addr_any;
         addr.sin6_port = 0;
 
-        if (bind(sd, (sockaddr *) &addr, sizeof(addr)) != 0) {
+        if (SOCKET_bind(sd, (sockaddr *)&addr, sizeof(addr)) != 0) {
             auto prefix = __FUNC__ "bind() failed";
             Logger::LogError(WSAGetLastErrorMessage(prefix));
 
@@ -423,10 +470,9 @@ bool Bind(SOCKET sd, const ADDRINFOEX &ai) {
 
 void Request::PostConnect() {
     if (!m_ai) {
-        delete m_qcontext;
-        m_qcontext = nullptr;
-
+        DelQueryContext();
         DeleteThis();
+
         return;
     }
 
@@ -452,8 +498,11 @@ void Request::PostConnect() {
 
     m_ccontext.sd = sd;
 
-    // 不管怎么样，总是先加入到缓存
-    DNSCache::Add(m_host.GetFullName(), *m_ai);
+    // 假如本身来自缓存，就不要重新加进去了
+    if (!m_qcontext) {
+        DNSCache::Add(m_host.GetFullName(), *m_ai);
+    }
+    
     m_ai = m_ai->ai_next;
 
     //-------------------------------------------
@@ -500,9 +549,7 @@ void Request::OnConnectCompleted() {
         return;
     }
 
-    delete m_qcontext;
-    m_qcontext = nullptr;
-    m_ai = nullptr;
+    DelQueryContext();
 
     if (!m_host.tunel && m_ccontext.tx < m_vbuf.size() - 1) {
         DeleteThis(); // TODO: 重发？
@@ -524,7 +571,7 @@ void Request::OnConnectCompleted() {
 
     if (m_host.tunel) {
         const char *confirm = "HTTP/1.1 200 Connection Established\r\n\r\n";
-        auto tc = new TxContext(m_bcontext.sd, confirm, strlen(confirm));
+        auto tc = NewTxContext(m_bcontext.sd, confirm, strlen(confirm));
 
         if (!PostSend(tc)) {
             DeleteThis();
@@ -602,7 +649,23 @@ TxContext *Request::NewTxContext(SOCKET sd, const RxContext &context) {
     assert(context.rx > 0);
     assert(context.IsOk());
 
-    return new TxContext(sd, context.buf, context.rx);
+    return NewTxContext(sd, context.buf, context.rx);
+}
+
+/*static*/
+TxContext *Request::NewTxContext(SOCKET sd, const char *buf, int len) {
+    TxContext *tc = TxContextPool::GetInstance().Allocate();
+    tc->Init(sd, buf, len);
+
+    return tc;
+}
+
+/*static*/
+void Request::DelTxContext(TxContext *context) {
+    assert(context);
+
+    context->Reset();
+    TxContextPool::GetInstance().DeAllocate(context);
 }
 
 void Request::SetRxReqPostedMark(bool browser, bool posted) {
@@ -617,7 +680,10 @@ void Request::SetRxReqPostedMark(bool browser, bool posted) {
 }
 
 bool Request::PostRecv(RxContext &context) {
-    assert(m_bcontext.IsOk() && context.IsOk());
+    // 其他线程关闭了连接
+    if (!m_bcontext.IsOk() || !context.IsOk()) {
+        return false;
+    }
 
     assert(context.sd != m_bcontext.sd || !m_brxPosted);
     assert(context.sd != m_scontext.sd || !m_srxPosted);
@@ -657,7 +723,12 @@ bool Request::PostRecv(RxContext &context) {
 
 bool Request::PostSend(TxContext *context) {
     assert(context);
-    assert(m_bcontext.IsOk() && context->IsOk());
+
+    // 当我们向浏览器发送数据时，其他线程关闭了面向浏览器的读连接
+    if (!m_bcontext.IsOk() || !context->IsOk()) {
+        DelTxContext(context);
+        return false;
+    }
 
     int iResult = WSASend(context->sd,
                           context->buffers,
@@ -794,4 +865,11 @@ string Request::Host::GetFullName() const {
     fullName.resize(fullName.length() - (5 - written));
 
     return fullName;
+}
+
+//////////////////////////////////////////////////////////////////////////
+
+RequestPool &RequestPool::GetInstance() {
+    static RequestPool s_pool;
+    return s_pool;
 }

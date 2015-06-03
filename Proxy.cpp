@@ -8,6 +8,8 @@
 #include <sstream>
 using namespace std;
 
+#include "Debug.hpp"
+
 
 //////////////////////////////////////////////////////////////////////////
 
@@ -17,6 +19,10 @@ LPFN_CONNECTEX lpfnConnectEx;
 
 
 //////////////////////////////////////////////////////////////////////////
+
+static int GetThreadCount() {
+    return GetMaximumProcessorCount(ALL_PROCESSOR_GROUPS);
+}
 
 bool AssociateWithCompletionPort(SOCKET sd, HANDLE cp, ULONG_PTR key) {
     // Associate the accept socket with the completion port.
@@ -39,42 +45,43 @@ bool AssociateWithCompletionPort(SOCKET sd, HANDLE cp, ULONG_PTR key) {
 //////////////////////////////////////////////////////////////////////////
 
 MyProxy::MyProxy()
-    : m_listener(INVALID_SOCKET),
-      m_cp(nullptr),
-      m_requestPoolSize(0),
-      m_numActiveRequests(0) {
-    
+    : m_listener(INVALID_SOCKET) {
+    m_numExitedThreads = 0;
+
+    // 强制初始化内存池
+    TxContextPool::GetInstance();
+    RequestPool::GetInstance();
 }
 
 MyProxy::~MyProxy() {
-    if (m_cp) {
+    if (m_cp && m_listener != INVALID_SOCKET) {
+        int count = GetThreadCount();
+
+        for (int i = 0; i < count; i++) {
+            PostQueuedCompletionStatus(m_cp, 0, SCK_EXIT, nullptr);
+        }
+
+        while (m_numExitedThreads < count) {
+            Sleep(100);
+        }
+
+        closesocket(m_listener);
+        m_listener = INVALID_SOCKET;
+
         CloseHandle(m_cp);
         m_cp = nullptr;
     }
-
-    if (m_listener != INVALID_SOCKET) {
-        closesocket(m_listener);
-        m_listener = INVALID_SOCKET;
-    }
 }
 
-bool MyProxy::Run(const char *addr, u_short port) {
+bool MyProxy::Start(const char *addr, u_short port) {
     enum {
         INIT_REQUEST_POOL_SIZE = 64,
     };
 
-    if (SetUpListener(addr, port) &&
-        GetIocpFunctionPointers(m_listener) &&
-        SpawnThreads() &&
-        SpawnAcceptors(INIT_REQUEST_POOL_SIZE)) {
-            while (true) {
-                Sleep(10 * 1000);
-            }
-
-            return true;
-    }
-
-    return false;
+    return SetUpListener(addr, port) &&
+           GetIocpFunctionPointers(m_listener) &&
+           SpawnThreads() &&
+           SpawnAcceptors(INIT_REQUEST_POOL_SIZE);
 }
 
 /*static*/
@@ -140,14 +147,14 @@ bool MyProxy::GetIocpFunctionPointers(SOCKET sd) {
 }
 
 bool MyProxy::SetUpListener(const char *addr, int port) {
-    ostringstream ss;
+    ostringstream oss;
     
     m_cp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, 0, 0, 0);
     if (m_cp == nullptr) {
-        ss << __FUNC__ "CreateIoCompletionPort() failed with error: "
-           << GetLastError();
+        oss << __FUNC__ "CreateIoCompletionPort() failed with error: "
+            << GetLastError();
 
-        Logger::LogError(ss.str());
+        Logger::LogError(oss.str());
         return false;
     }
 
@@ -155,8 +162,11 @@ bool MyProxy::SetUpListener(const char *addr, int port) {
     // operations as the default behavior.
     m_listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (m_listener == INVALID_SOCKET) {
-        ss << WSAGetLastErrorMessage(__FUNC__ "bind() failed") << endl;
-        Logger::LogError(ss.str());
+        oss << WSAGetLastErrorMessage(__FUNC__ "bind() failed") << endl;
+        Logger::LogError(oss.str());
+
+        CloseHandle(m_cp);
+        m_cp = nullptr;
 
         return false;
     }
@@ -165,10 +175,10 @@ bool MyProxy::SetUpListener(const char *addr, int port) {
     HANDLE cp = CreateIoCompletionPort((HANDLE) m_listener, m_cp, 0, 0);
 
     if (cp == nullptr) {
-        ss << "CreateIoCompletionPort() associate failed with error: "
-           <<  GetLastError() << endl;
+        oss << "CreateIoCompletionPort() associate failed with error: "
+            <<  GetLastError() << endl;
+        Logger::LogError(oss.str());
 
-        Logger::LogError(ss.str());
         return false;
     }
 
@@ -179,7 +189,7 @@ bool MyProxy::SetUpListener(const char *addr, int port) {
         auto fmt = __FUNC__ "inet_addr() failed";
         Logger::LogError(WSAGetLastErrorMessage(fmt));
 
-        return false;
+        goto ERROR_HANDLER;
     }
 
     sockaddr_in sinInterface;
@@ -187,27 +197,41 @@ bool MyProxy::SetUpListener(const char *addr, int port) {
     sinInterface.sin_addr.s_addr = nInterfaceAddr;
     sinInterface.sin_port = htons(port);
 
-    if (bind(m_listener, (sockaddr *) &sinInterface, 
+    if (SOCKET_bind(m_listener, (sockaddr *)&sinInterface,
         sizeof(sockaddr_in)) == SOCKET_ERROR) {
-            ss << WSAGetLastErrorMessage(__FUNC__ "bind() failed") << endl;
-            Logger::LogError(ss.str());
+            oss << WSAGetLastErrorMessage(__FUNC__ "bind() failed") << endl;
+            Logger::LogError(oss.str());
 
-            return false;
+            goto ERROR_HANDLER;
     }
 
     if (listen(m_listener, SOMAXCONN) == SOCKET_ERROR) {
-        ss << WSAGetLastErrorMessage(__FUNC__ "listen() failed") << endl;
-        Logger::LogError(ss.str());
+        oss << WSAGetLastErrorMessage(__FUNC__ "listen() failed") << endl;
+        Logger::LogError(oss.str());
 
-        return false;
+        goto ERROR_HANDLER;
     }
 
     return true;
+
+ERROR_HANDLER:
+
+    closesocket(m_listener);
+    m_listener = INVALID_SOCKET;
+
+    CloseHandle(m_cp);
+    m_cp = nullptr;
+
+    return false;
 }
 
 bool MyProxy::SpawnAcceptors(int num) {
+    m_acceptors.reserve(m_acceptors.size() + num);
+
     for (int i = 0; i < num; i++) {
         RxContext *context = new RxContext(INVALID_SOCKET);
+        m_acceptors.emplace_back(context);
+
         if (!PostAccept(*context)) {
             return false;
         }
@@ -260,8 +284,8 @@ bool MyProxy::PostAccept(RxContext &context) {
 }
 
 bool MyProxy::SpawnThreads() {
-    DWORD dwProcessors = GetMaximumProcessorCount(ALL_PROCESSOR_GROUPS);
-    for (DWORD i = 0; i < dwProcessors; i++) {
+    int count = GetThreadCount();
+    for (int i = 0; i < count; i++) {
         HANDLE h = CreateThread(nullptr, 0, ProxyHandler, this, 0, nullptr);
         if (h == nullptr) {
             ostringstream ss;
@@ -295,7 +319,7 @@ DWORD CALLBACK MyProxy::ProxyHandler(PVOID pv) {
                 if (pic->action == PerIoContext::CONNECT) {
                     transfered = -1;
 
-                    goto CONNECT_HANDLER;
+                    goto HANDLERS;
                 }
                 else {
                     Logger::LogError(__FUNC__ "What timed out?");
@@ -303,11 +327,11 @@ DWORD CALLBACK MyProxy::ProxyHandler(PVOID pv) {
 
                 break;
 
+            // 为防止内存泄漏，我们总是处理这些套接字已失效的异常情况
+
             // 似乎这两个错误是由我们主动 closesocket() 引发的
             case ERROR_OPERATION_ABORTED:
             case ERROR_INVALID_NETNAME:
-                break;
-
             // 似乎由浏览器端强制断开引发的
             case ERROR_NETNAME_DELETED:
                 transfered = 0;
@@ -328,6 +352,7 @@ DWORD CALLBACK MyProxy::ProxyHandler(PVOID pv) {
         }
 
         if (key == SCK_EXIT) {
+            This->m_numExitedThreads++;
             break;
         }
         else if (key == SCK_NAME_RESOLVE) {
@@ -357,16 +382,15 @@ HANDLERS:
         }
 
         case PerIoContext::CONNECT: {
-CONNECT_HANDLER:
             ConnectContext *context = (ConnectContext *) pic;
             
-            if (transfered != -1) {
-                context->tx = transfered;
-                context->connected = true;
-            }
-            else {
+            if (transfered == -1) {
                 context->tx = 0;
                 context->connected = false;
+            }
+            else {
+                context->tx = transfered;
+                context->connected = true;
             }
 
             Request *req = (Request *) key;
@@ -405,11 +429,12 @@ CONNECT_HANDLER:
 }
 
 void MyProxy::DoAccept(RxContext &context) {
-    Request *req = new Request(context, m_cp);
+    Request *req = RequestPool::GetInstance().Allocate();
+    req->Init(m_cp, context);
 
     // Associate the accept socket with the completion port.
     if (!AssociateWithCompletionPort(context.sd, m_cp, (ULONG_PTR) req)) {
-        delete req;
+        RequestPool::GetInstance().DeAllocate(req);
         return;
     }
 
