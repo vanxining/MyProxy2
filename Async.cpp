@@ -24,7 +24,7 @@ AsyncResolver::QueryContext::QueryContext
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
 
-    // WTF!! swprintf_s 都写了一些什么垃圾数据进去？？
+    // swprintf_s 不能用
     swprintf(service, sizeof(service), L"%u", port);
 
     ts = time(nullptr);
