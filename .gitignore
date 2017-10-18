@@ -36,6 +36,8 @@
 *.vspx
 *.pdb
 *.ilk
+Makefile
+*.make
 
 # Scripts
 *.py
